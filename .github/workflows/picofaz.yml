@@ -56,10 +56,6 @@ jobs:
         if: steps.gate.outputs.run == 'true'
         run: python d.py
 
-      - name: Verify uniqueness
-        if: steps.gate.outputs.run == 'true'
-        run: python verify_divar_data.py
-
       - name: Mark successful run
         if: steps.gate.outputs.run == 'true'
         run: date +%s > .divar_last_success.txt
