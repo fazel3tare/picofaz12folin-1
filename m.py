@@ -9,12 +9,14 @@ LIST_API_URL = "https://api.divar.ir/v8/postlist/w/search"
 DETAIL_API_URL = "https://api.divar.ir/v8/posts-v2/web/{token}"
 
 TARGET = 10000
-PAUSE = 1.0
-TIMEOUT = 30
-# کم کردن concurrency تا کمتر rate-limit بخوریم
-DETAIL_WORKERS = 3
-DETAIL_TIMEOUT = 30
-DETAIL_PAUSE = 0.35  # مکث بین هر detail/html
+PAUSE = 0.6
+TIMEOUT = 20
+# سرعت بالاتر — در صورت 429/بلاک، DETAIL_WORKERS را کم کن
+DETAIL_WORKERS = 12
+DETAIL_TIMEOUT = 1
+DETAIL_PAUSE = 0.0
+# اگر True باشد فقط برای آگهی‌هایی که قیمت/عکس ندارند detail می‌زند (خیلی سریع‌تر، بدون کارکرد)
+SKIP_DETAIL_IF_PRICE_OK = False
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
@@ -52,16 +54,25 @@ def make_body(pagination_data=None):
     return body
 
 
-def get_page(pagination_data=None):
-    r = session.post(
-        LIST_API_URL,
-        json=make_body(pagination_data),
-        timeout=TIMEOUT,
-    )
-    print("LIST STATUS:", r.status_code)
-    print("LIST SIZE:", len(r.content))
-    r.raise_for_status()
-    return r.json()
+def get_page(pagination_data=None, retries=3):
+    last_err = None
+    for attempt in range(1, retries + 1):
+        try:
+            r = session.post(
+                LIST_API_URL,
+                json=make_body(pagination_data),
+                timeout=TIMEOUT,
+            )
+            print("LIST STATUS:", r.status_code)
+            print("LIST SIZE:", len(r.content))
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last_err = e
+            wait = min(30, 2 ** attempt)
+            print(f"LIST ERROR (try {attempt}/{retries}): {repr(e)} — sleep {wait}s")
+            time.sleep(wait)
+    raise last_err
 
 
 def get_detail(token):
@@ -696,71 +707,60 @@ def enrich_one(post):
     detail_ok = False
     html_ok = False
 
-    # اگر از همان کارت/API کامل است، هیچ درخواست اضافه‌ای نزن.
-    if (
-        post.get("price") is not None
-        and post.get("image")
-        and post.get("mileage") is not None
-    ):
+    has_price = post.get("price") is not None
+    has_image = bool(post.get("image"))
+    has_mileage = post.get("mileage") is not None
+
+    # کامل از لیست → هیچ درخواست اضافه
+    if has_price and has_image and has_mileage:
         return post, True, None
 
-    time.sleep(DETAIL_PAUSE)
+    # حالت فوق‌سریع: قیمت و عکس از لیست کافی است، detail نزن
+    if SKIP_DETAIL_IF_PRICE_OK and has_price and has_image:
+        return post, True, None
 
-    # مرحله ۱: Detail API (با یک بار retry)
-    for attempt in range(2):
-        try:
-            detail = get_detail(post["token"])
-            detail_ok = True
+    if DETAIL_PAUSE > 0:
+        time.sleep(DETAIL_PAUSE)
 
-            if post.get("price") is None:
-                post["price"] = extract_price(detail)
-            if not post.get("image"):
-                post["image"] = extract_image(detail)
-            if post.get("mileage") is None:
-                post["mileage"] = extract_mileage(detail)
+    # فقط Detail API (یک بار، بدون retry سنگین)
+    try:
+        detail = get_detail(post["token"])
+        detail_ok = True
 
-            if not post.get("title"):
-                post["title"] = find_direct_value(detail, {"title", "post_title"})
-            if not post.get("city"):
-                post["city"] = find_direct_value(
-                    detail, {"city_persian", "city", "city_name"}
-                )
-            if not post.get("district"):
-                post["district"] = find_direct_value(
-                    detail, {"district_persian", "district", "district_name"}
-                )
-            if not post.get("description"):
-                post["description"] = find_direct_value(
-                    detail, {"description", "middle_description", "top_description"}
-                )
-            break
-        except Exception:
-            if attempt == 0:
-                time.sleep(0.8)
-            else:
-                pass
+        if post.get("price") is None:
+            post["price"] = extract_price(detail)
+        if not post.get("image"):
+            post["image"] = extract_image(detail)
+        if post.get("mileage") is None:
+            post["mileage"] = extract_mileage(detail)
 
-    # مرحله ۲: HTML صفحه آگهی برای فیلدهای باقی‌مانده
-    # مهم: حتی اگر detail موفق باشد ولی price/mileage خالی باشد، HTML را بخوان
-    if (
-        post.get("price") is None
-        or post.get("mileage") is None
-        or not post.get("district")
-        or not post.get("description")
-        or not post.get("image")
-        or not post.get("title")
-    ):
+        if not post.get("title"):
+            post["title"] = find_direct_value(detail, {"title", "post_title"})
+        if not post.get("city"):
+            post["city"] = find_direct_value(
+                detail, {"city_persian", "city", "city_name"}
+            )
+        if not post.get("district"):
+            post["district"] = find_direct_value(
+                detail, {"district_persian", "district", "district_name"}
+            )
+        if not post.get("description"):
+            post["description"] = find_direct_value(
+                detail, {"description", "middle_description", "top_description"}
+            )
+    except Exception:
+        pass
+
+    # HTML فقط وقتی قیمت هنوز خالی است (گرانی شبکه)
+    if post.get("price") is None:
         post, html_ok, _ = enrich_from_html(post)
 
     ok = (
         detail_ok
         or html_ok
-        or (
-            post.get("price") is not None
-            or post.get("mileage") is not None
-            or bool(post.get("image"))
-            or bool(post.get("title"))
-        )
+        or post.get("price") is not None
+        or bool(post.get("image"))
+        or bool(post.get("title"))
     )
 
     return post, ok, None
@@ -827,10 +827,38 @@ def save_debug(data):
         json.dump(data, f, ensure_ascii=False, indent=2)
 
 
+def save_progress(posts, path="divar_motorcycles_partial.json"):
+    """ذخیره میانی تا در صورت گیر کردن داده از دست نرود."""
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(posts, f, ensure_ascii=False, indent=2)
+        print(f"[SAVE] {len(posts)} آگهی → {path}")
+    except Exception as e:
+        print("SAVE ERROR:", repr(e))
+
+
 def main():
     all_posts = {}
     cursor = None
     request_number = 1
+    stagnant_rounds = 0  # چند صفحه پشت‌سرهم بدون آگهی جدید
+    MAX_STAGNANT = 5
+
+    # ادامه از فایل partial اگر وجود داشت
+    partial_path = "divar_motorcycles_partial.json"
+    try:
+        with open(partial_path, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+        if isinstance(existing, list) and existing:
+            for p in existing:
+                tok = p.get("token")
+                if tok:
+                    all_posts[tok] = p
+            print(f"ادامه از {partial_path}: {len(all_posts)} آگهی قبلی")
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print("خواندن partial ناموفق:", repr(e))
 
     while len(all_posts) < TARGET:
         print("\n" + "=" * 70)
@@ -840,7 +868,8 @@ def main():
         try:
             data = get_page(cursor)
         except Exception as e:
-            print("REQUEST ERROR:", repr(e))
+            print("REQUEST ERROR (final):", repr(e))
+            save_progress(list(all_posts.values()))
             break
 
         if request_number == 1:
@@ -853,6 +882,7 @@ def main():
         if not posts:
             print("\nهیچ POST_ROW پیدا نشد.")
             save_debug(data)
+            save_progress(list(all_posts.values()))
             break
 
         new_count = 0
@@ -865,6 +895,21 @@ def main():
         print("جدید:", new_count)
         print("مجموع یکتا:", len(all_posts))
 
+        if new_count == 0:
+            stagnant_rounds += 1
+            print(f"بدون آگهی جدید ({stagnant_rounds}/{MAX_STAGNANT})")
+            if stagnant_rounds >= MAX_STAGNANT:
+                print("\nچند صفحه پشت‌سرهم آگهی جدید نبود — توقف.")
+                save_debug(data)
+                save_progress(list(all_posts.values()))
+                break
+        else:
+            stagnant_rounds = 0
+
+        # هر ۲۰ درخواست یکبار ذخیره میانی
+        if request_number % 20 == 0:
+            save_progress(list(all_posts.values()))
+
         next_cursor, has_next = get_pagination(data)
         print("HAS NEXT:", has_next)
 
@@ -875,24 +920,34 @@ def main():
         if not next_cursor:
             print("\npagination.data وجود ندارد.")
             save_debug(data)
+            save_progress(list(all_posts.values()))
             break
 
-        if next_cursor == cursor:
-            print("\nCURSOR تکراری شد.")
-            break
+        # مقایسه پایدار cursor (dict ممکن است ترتیب کلید عوض شود)
+        if cursor is not None:
+            try:
+                same = json.dumps(next_cursor, sort_keys=True, ensure_ascii=False) == json.dumps(
+                    cursor, sort_keys=True, ensure_ascii=False
+                )
+            except Exception:
+                same = next_cursor == cursor
+            if same:
+                print("\nCURSOR تکراری شد.")
+                save_progress(list(all_posts.values()))
+                break
 
         cursor = next_cursor
         request_number += 1
         time.sleep(PAUSE)
 
     result = list(all_posts.values())[:TARGET]
+    save_progress(result, "divar_motorcycles_partial.json")
 
     result = enrich_posts(result)
 
     with open("divar_motorcycles.json", "w", encoding="utf-8") as f:
         json.dump(result, f, ensure_ascii=False, indent=2)
 
-    # آمار سریع برای کنترل کیفیت
     with_price = sum(1 for p in result if p.get("price") is not None)
     with_mileage = sum(1 for p in result if p.get("mileage") is not None)
     print("\n" + "=" * 70)
