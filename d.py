@@ -371,7 +371,7 @@ def main():
 
     print(
         "فایل:",
-        "divar_cars.json"
+        "d.json"
     )
 
 
