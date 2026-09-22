@@ -5,8 +5,8 @@ from urllib.parse import urlparse, unquote
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-URL = "https://divar.ir/s/iran/car"
-OUTPUT = "divar_cars.json"
+URL = "https://divar.ir/s/iran/motorcycles"
+OUTPUT = "divar_motorcycles.json"
 TARGET = 10000
 SCROLL_WAIT_MS = 10000
 MAX_IDLE_ROUNDS = 25
