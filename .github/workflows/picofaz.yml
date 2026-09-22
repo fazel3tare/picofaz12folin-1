@@ -1,16 +1,12 @@
-name: D Scraper
+name: Divar Scraper
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "0 * * * *"
 
 permissions:
   contents: write
-
-concurrency:
-  group: divar-scraper
-  cancel-in-progress: false
 
 jobs:
   divar:
@@ -25,51 +21,37 @@ jobs:
         with:
           python-version: "3.13"
 
-      - name: Install requests
-        run: python -m pip install requests
-
-      - name: 75-minute gate
-        id: gate
-        shell: bash
+      - name: Install Playwright
         run: |
-          now=$(date +%s)
-          last=0
-          if [ -f .divar_last_success.txt ]; then
-            last=$(cat .divar_last_success.txt || echo 0)
-          fi
-
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ $((now-last)) -ge 4500 ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
-
-          echo "now=$now"
-          echo "last=$last"
-          echo "elapsed=$((now-last))"
-
-      - name: Run Motorcycles
-        if: steps.gate.outputs.run == 'true'
-        run: python m.py
+          python -m pip install --upgrade pip
+          python -m pip install playwright
+          python -m playwright install --with-deps chromium
 
       - name: Run Cars
-        if: steps.gate.outputs.run == 'true'
         run: python d.py
 
-      - name: Verify uniqueness
-        if: steps.gate.outputs.run == 'true'
-        run: python verify_divar_data.py
+      - name: Run Motorcycles
+        run: python m.py
 
-      - name: Mark successful run
-        if: steps.gate.outputs.run == 'true'
-        run: date +%s > .divar_last_success.txt
+      - name: Validate JSON
+        run: |
+          python - <<'PY'
+          import json
+          for name in ("divar_cars.json", "divar_motorcycles.json"):
+              with open(name, encoding="utf-8") as f:
+                  data = json.load(f)
+              tokens = [x.get("token") for x in data if x.get("token")]
+              if len(tokens) != len(set(tokens)):
+                  raise SystemExit(f"Duplicate token detected: {name}")
+              print(name, "count=", len(data), "unique=", len(tokens))
+          PY
 
       - name: Commit updated data
-        if: steps.gate.outputs.run == 'true'
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-          git add divar_motorcycles.json divar_cars.json .divar_last_success.txt
-          git diff --cached --quiet || git commit -m "Update Divar data"
+          git add divar_cars.json divar_motorcycles.json
+
+          git diff --cached --quiet || git commit -m "Update Divar DOM data"
           git push
