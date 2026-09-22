@@ -7,10 +7,10 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 URL = "https://divar.ir/s/iran/motorcycles"
 OUTPUT = "divar_motorcycles.json"
-TARGET = 10000
-SCROLL_WAIT_MS = 10000
+TARGET = 100
+SCROLL_WAIT_MS = 100
 MAX_IDLE_ROUNDS = 25
-PAGE_TIMEOUT = 60000
+PAGE_TIMEOUT = 600
 
 DIGIT_TRANS = str.maketrans(
     "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
