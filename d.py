@@ -69,6 +69,135 @@ def get_detail(token):
     return r.json()
 
 
+
+
+def strip_html_text(value):
+    if value is None:
+        return None
+    import html as _html
+    value = re.sub(r"<[^>]+>", " ", str(value), flags=re.S)
+    value = _html.unescape(value)
+    value = re.sub(r"\s+", " ", value).strip()
+    return value or None
+
+
+def fetch_post_html(token):
+    url = f"https://divar.ir/v/{token}"
+    r = requests.get(
+        url,
+        headers={
+            "User-Agent": HEADERS.get("User-Agent", "Mozilla/5.0"),
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Referer": "https://divar.ir/",
+        },
+        timeout=DETAIL_TIMEOUT,
+    )
+    r.raise_for_status()
+    return r.text
+
+
+def extract_post_card_from_html(raw_html):
+    if not raw_html:
+        return {}
+
+    result = {}
+
+    title_match = re.search(
+        r'<h2[^>]*class=["\'][^"\']*kt-post-card__title[^"\']*["\'][^>]*>(.*?)</h2>',
+        raw_html,
+        flags=re.I | re.S,
+    )
+    if title_match:
+        result["title"] = strip_html_text(title_match.group(1))
+
+    descriptions = re.findall(
+        r'<div[^>]*class=["\'][^"\']*kt-post-card__description[^"\']*["\'][^>]*>(.*?)</div>',
+        raw_html,
+        flags=re.I | re.S,
+    )
+    descriptions = [strip_html_text(x) for x in descriptions]
+    descriptions = [x for x in descriptions if x]
+
+    for text in descriptions:
+        normalized = normalize_digits(text)
+        if "تومان" in normalized:
+            result["price"] = extract_price(text)
+        elif "کیلومتر" in normalized or re.search(r'\bkm\b', normalized, re.I):
+            result["mileage"] = extract_mileage(text)
+
+    # fallback for cards where the order/label differs
+    if result.get("price") is None:
+        for text in descriptions:
+            parsed = extract_price(text)
+            if parsed is not None and ("تومان" in normalize_digits(text) or re.fullmatch(r'[0-9۰-۹٠-٩,، .]+', text or '')):
+                result["price"] = parsed
+                break
+
+    if result.get("mileage") is None:
+        for text in descriptions:
+            if "کیلومتر" in normalize_digits(text) or re.search(r'\bkm\b', normalize_digits(text), re.I):
+                result["mileage"] = extract_mileage(text)
+                break
+
+    # Any remaining description is real card description, not price/mileage.
+    extra = []
+    for text in descriptions:
+        n = normalize_digits(text)
+        if "تومان" in n or "کیلومتر" in n or re.search(r'\bkm\b', n, re.I):
+            continue
+        extra.append(text)
+    if extra:
+        result["description"] = " | ".join(extra)
+
+    bottom_match = re.search(
+        r'<span[^>]*class=["\'][^"\']*kt-post-card__bottom-description[^"\']*["\'][^>]*>(.*?)</span>',
+        raw_html,
+        flags=re.I | re.S,
+    )
+    if bottom_match:
+        bottom = strip_html_text(bottom_match.group(1))
+        result["bottom_text"] = bottom
+        if bottom:
+            m = re.search(r'\bدر\s+(.+?)\s*$', bottom)
+            if m:
+                result["district"] = m.group(1).strip()
+
+    image_match = re.search(
+        r'<img[^>]*class=["\'][^"\']*kt-image-block__image[^"\']*["\'][^>]*src=["\']([^"\']+)',
+        raw_html,
+        flags=re.I | re.S,
+    )
+    if image_match:
+        result["image"] = image_match.group(1).strip()
+
+    return result
+
+
+def enrich_from_html(post):
+    try:
+        raw_html = fetch_post_html(post["token"])
+        card = extract_post_card_from_html(raw_html)
+        if not card:
+            return post, False, "html_card_not_found"
+
+        if not post.get("title") and card.get("title"):
+            post["title"] = card["title"]
+        if post.get("price") is None and card.get("price") is not None:
+            post["price"] = card["price"]
+        if post.get("mileage") is None and card.get("mileage") is not None:
+            post["mileage"] = card["mileage"]
+        if not post.get("description") and card.get("description"):
+            post["description"] = card["description"]
+        if not post.get("district") and card.get("district"):
+            post["district"] = card["district"]
+        if not post.get("image") and card.get("image"):
+            post["image"] = card["image"]
+
+        return post, True, None
+    except Exception as e:
+        return post, False, repr(e)
+
+
 def normalize_digits(value):
     if value is None:
         return ""
@@ -185,10 +314,13 @@ def extract_image(obj):
 
 
 def extract_price(obj):
-    value = find_direct_value(obj, {
+    if isinstance(obj, str):
+        value = obj
+    else:
+        value = find_direct_value(obj, {
         "price", "price_value", "current_price", "total_price", "amount",
         "price_text", "price_value_text"
-    })
+        })
     if isinstance(value, dict):
         value = find_direct_value(value, {"value", "text", "price", "amount", "display_value"})
     if value is None:
@@ -214,10 +346,13 @@ def extract_price(obj):
 
 
 def extract_mileage(obj):
-    value = find_direct_value(obj, {
+    if isinstance(obj, str):
+        value = obj
+    else:
+        value = find_direct_value(obj, {
         "mileage", "kilometer", "kilometers", "km", "distance",
         "mileage_text", "kilometer_text", "odometer", "کارکرد"
-    })
+        })
     if isinstance(value, dict):
         value = find_direct_value(value, {"value", "text", "mileage", "kilometers", "km", "distance", "display_value"})
     if value is None:
@@ -298,52 +433,56 @@ def extract_posts(data):
 
 
 def enrich_one(post):
-    # فقط زمانی Detail بزن که حداقل یکی از سه فیلد مهم ناقص باشد.
+    detail_ok = False
+    html_ok = False
+
+    # اگر از همان کارت/API کامل است، هیچ درخواست اضافه‌ای نزن.
     if post.get("price") is not None and post.get("image") and post.get("mileage") is not None:
         return post, True, None
 
+    # مرحله ۱: Detail API
     try:
         detail = get_detail(post["token"])
+        detail_ok = True
 
-        price = post.get("price")
-        image = post.get("image")
-        mileage = post.get("mileage")
+        if post.get("price") is None:
+            post["price"] = extract_price(detail)
+        if not post.get("image"):
+            post["image"] = extract_image(detail)
+        if post.get("mileage") is None:
+            post["mileage"] = extract_mileage(detail)
 
-        if price is None:
-            price = extract_price(detail)
-        if not image:
-            image = extract_image(detail)
-        if mileage is None:
-            mileage = extract_mileage(detail)
+        if not post.get("title"):
+            post["title"] = find_direct_value(detail, {"title", "post_title"})
+        if not post.get("city"):
+            post["city"] = find_direct_value(detail, {"city_persian", "city", "city_name"})
+        if not post.get("district"):
+            post["district"] = find_direct_value(detail, {"district_persian", "district", "district_name"})
+        if not post.get("description"):
+            post["description"] = find_direct_value(detail, {"description", "middle_description", "top_description"})
 
-        title = post.get("title")
-        city = post.get("city")
-        district = post.get("district")
-        description = post.get("description")
+    except Exception:
+        # شکست Detail API نباید مانع خواندن HTML شود.
+        pass
 
-        if not title:
-            title = find_direct_value(detail, {"title", "post_title"})
-        if not city:
-            city = find_direct_value(detail, {"city_persian", "city", "city_name"})
-        if not district:
-            district = find_direct_value(detail, {"district_persian", "district", "district_name"})
-        if not description:
-            description = find_direct_value(detail, {"description", "middle_description", "top_description"})
+    # مرحله ۲: HTML واقعی صفحه آگهی برای فیلدهای باقی‌مانده
+    if (post.get("price") is None or post.get("mileage") is None
+            or not post.get("district") or not post.get("description")
+            or not post.get("image") or not post.get("title")):
+        post, html_ok, _ = enrich_from_html(post)
 
-        post.update({
-            "title": title,
-            "city": city,
-            "district": district,
-            "description": description,
-            "price": price,
-            "mileage": mileage,
-            "image": image,
-        })
+    ok = (
+        detail_ok
+        or html_ok
+        or (
+            post.get("price") is not None
+            or post.get("mileage") is not None
+            or bool(post.get("image"))
+            or bool(post.get("title"))
+        )
+    )
 
-        return post, True, None
-
-    except Exception as e:
-        return post, False, repr(e)
+    return post, ok, None
 
 
 def enrich_posts(posts):
